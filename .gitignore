@@ -1,0 +1,17 @@
+__pycache__/
+.venv/
+.conda/
+.streamlit/
+*.db
+*.sqlite
+*.pyc
+*.pyo
+*.pyd
+*.log
+.DS_Store
+/data/*.csv
+/data/*.xlsx
+/data/*.json
+/data/*.parquet
+/.idea/
+/.vscode/
