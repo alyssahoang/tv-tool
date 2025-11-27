@@ -95,15 +95,28 @@ def seed_influencers(campaign_id: int, publish_links: List[str]) -> None:
         profile = scraping.fetch_kol_profile(link)
         influencer = database.upsert_influencer(profile)
         join_row = database.ensure_campaign_influencer(campaign_id, influencer["id"])
+        payload = {
+            "profiles": [
+                {
+                    "Full Name": profile.get("name"),
+                    "Handle": profile.get("handle"),
+                    "Platform": profile.get("platform"),
+                    "Followers": profile.get("follower_count"),
+                    "Bio": profile.get("bio"),
+                    "Image URL": profile.get("profile_image"),
+                    "Details": profile.get("demographics"),
+                }
+            ]
+        }
         database.add_kol_source(
             campaign_id=campaign_id,
             publish_link=link,
             platform=profile["platform"],
-            payload=profile,
+            payload=payload,
             status="seeded",
         )
         payload = generate_score_payload()
-        database.save_campaign_influencer_scores(join_row["id"], payload)
+        database.save_campaign_influencer_scores(join_row["campaign_influencer_id"], payload)
         print(
             f"[seed] Added {influencer['name']} ({influencer['platform']}) "
             f"to campaign_id={campaign_id} with total score {payload['total_score']}."

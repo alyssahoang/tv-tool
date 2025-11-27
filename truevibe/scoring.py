@@ -183,13 +183,17 @@ def build_score_payload(
     interest_score: float,
     engagement_rate: float,
     engagement_score: float,
+    content_balance_score: Optional[float] = None,
+    organic_posts_l2m: Optional[float] = None,
+    sponsored_posts_l2m: Optional[float] = None,
+    saturation_rate: Optional[float] = None,
     content_originality: float,
     content_creativity: float,
     authority_overall: float,
     values_overall: float,
     qualitative_notes: str,
 ) -> Dict[str, float | str]:
-    content_score = compute_content_score(content_originality, content_creativity)
+    content_score = compute_content_score(content_originality, content_creativity, content_balance_score)
     authority_score = compute_authority_score(authority_overall)
     values_score = compute_values_score(values_overall)
     total_score = compute_total_score(
@@ -205,6 +209,7 @@ def build_score_payload(
         "interest_score": round(_clamp(interest_score), 2),
         "engagement_rate": round(float(engagement_rate or 0.0), 4),
         "engagement_score": round(_clamp(engagement_score), 2),
+        "content_balance": round(_clamp(content_balance_score), 2) if content_balance_score is not None else None,
         "content_originality": round(_clamp(content_originality), 2),
         "content_creativity": round(_clamp(content_creativity), 2),
         "content_score": content_score,
@@ -212,4 +217,7 @@ def build_score_payload(
         "values_score": values_score,
         "total_score": total_score,
         "qualitative_notes": qualitative_notes.strip(),
+        "organic_posts_l2m": float(organic_posts_l2m) if organic_posts_l2m is not None else None,
+        "sponsored_posts_l2m": float(sponsored_posts_l2m) if sponsored_posts_l2m is not None else None,
+        "saturation_rate": round(float(saturation_rate), 4) if saturation_rate is not None else None,
     }

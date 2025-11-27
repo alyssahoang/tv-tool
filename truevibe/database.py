@@ -88,6 +88,9 @@ CREATE TABLE IF NOT EXISTS campaign_influencers (
     engagement_rate REAL,
     engagement_score REAL,
     content_balance REAL,
+    organic_posts_l2m REAL,
+    sponsored_posts_l2m REAL,
+    saturation_rate REAL,
     content_originality REAL,
     content_creativity REAL,
     content_score REAL,
@@ -212,6 +215,38 @@ def list_kol_sources(campaign_id: int) -> List[Dict[str, Any]]:
         return [_row_to_dict(row) for row in cur.fetchall()]
 
 
+def list_all_influencers(search: Optional[str] = None, limit: int = 500) -> List[Dict[str, Any]]:
+    """
+    List influencers across the entire workspace for reuse.
+    """
+    search_term = f"%{search.strip().lower()}%" if search else None
+    with session() as conn:
+        if search_term:
+            cur = conn.execute(
+                """
+                SELECT id, name, handle, platform, follower_count, last_seen_at
+                FROM influencers
+                WHERE lower(name) LIKE ?
+                   OR lower(handle) LIKE ?
+                   OR lower(platform) LIKE ?
+                ORDER BY last_seen_at DESC
+                LIMIT ?
+                """,
+                (search_term, search_term, search_term, limit),
+            )
+        else:
+            cur = conn.execute(
+                """
+                SELECT id, name, handle, platform, follower_count, last_seen_at
+                FROM influencers
+                ORDER BY last_seen_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        return [_row_to_dict(row) for row in cur.fetchall()]
+
+
 def upsert_influencer(profile: Dict[str, Any]) -> Dict[str, Any]:
     now = _now()
     handle = profile["handle"].strip().lower()
@@ -268,6 +303,10 @@ def ensure_campaign_influencer(campaign_id: int, influencer_id: int) -> Dict[str
                 ci.interest_score,
                 ci.engagement_rate,
                 ci.engagement_score,
+                ci.content_balance,
+                ci.organic_posts_l2m,
+                ci.sponsored_posts_l2m,
+                ci.saturation_rate,
                 ci.content_originality,
                 ci.content_creativity,
                 ci.content_score,
@@ -297,6 +336,9 @@ SCORE_COLUMNS = [
     "engagement_rate",
     "engagement_score",
     "content_balance",
+    "organic_posts_l2m",
+    "sponsored_posts_l2m",
+    "saturation_rate",
     "content_originality",
     "content_creativity",
     "content_score",
@@ -346,6 +388,10 @@ def list_campaign_influencers(campaign_id: int) -> List[Dict[str, Any]]:
                 ci.interest_score,
                 ci.engagement_rate,
                 ci.engagement_score,
+                ci.content_balance,
+                ci.organic_posts_l2m,
+                ci.sponsored_posts_l2m,
+                ci.saturation_rate,
                 ci.content_originality,
                 ci.content_creativity,
                 ci.content_score,

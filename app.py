@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import base64
+import re
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -22,9 +23,9 @@ from truevibe.creatoriq import CreatorIQError, is_creatoriq_link
 
 T = TypeVar("T")
 NAV_SECTIONS: Dict[str, str] = {
-    "Campaigns": "Briefs & context",
-    "KOL Workflow": "Import & Evaluate",
-    "Dashboard": "Insights",
+    "Campaign Briefs": "Briefs & context",
+    "Score Influencers": "Import & Evaluate",
+    "Insights & Reports": "Insights",
 }
 PLATFORM_PROFILE_URLS: Dict[str, str] = {
     "instagram": "https://www.instagram.com/{handle}",
@@ -35,21 +36,130 @@ PLATFORM_PROFILE_URLS: Dict[str, str] = {
 }
 VERO_COLORWAY = ["#0A6CC2", "#4BB7E5", "#0A223A", "#F6C343", "#F48668"]
 LINK_ICON_MAP: Dict[str, Dict[str, str]] = {
-    "instagram": {"icon": "📸", "label": "Instagram", "color": "#E4405F"},
-    "tiktok": {"icon": "🎵", "label": "TikTok", "color": "#010101"},
-    "youtube": {"icon": "▶️", "label": "YouTube", "color": "#FF0000"},
-    "facebook": {"icon": "📘", "label": "Facebook", "color": "#1778F2"},
-    "fb.com": {"icon": "📘", "label": "Facebook", "color": "#1778F2"},
-    "x.com": {"icon": "✖️", "label": "X / Twitter", "color": "#111827"},
-    "twitter": {"icon": "✖️", "label": "X / Twitter", "color": "#111827"},
-    "creatoriq": {"icon": "📊", "label": "CreatorIQ", "color": "#0A6CC2"},
+    "instagram": {"icon": "", "label": "Instagram", "color": "#E4405F"},
+    "tiktok": {"icon": "", "label": "TikTok", "color": "#010101"},
+    "youtube": {"icon": "", "label": "YouTube", "color": "#FF0000"},
+    "facebook": {"icon": "", "label": "Facebook", "color": "#1778F2"},
+    "fb.com": {"icon": "", "label": "Facebook", "color": "#1778F2"},
+    "x.com": {"icon": "", "label": "X / Twitter", "color": "#111827"},
+    "twitter": {"icon": "", "label": "X / Twitter", "color": "#111827"},
+    "creatoriq": {"icon": "", "label": "CreatorIQ", "color": "#0A6CC2"},
 }
 ICON_FILES: Dict[str, Path] = {
-    "instagram": Path("app/img/icon-instagram.svg"),
-    "tiktok": Path("app/img/icon-tiktok.svg"),
-    "facebook": Path("app/img/icon-facebook.svg"),
+    "instagram": Path("app/img/icon-instagram.png"),
+    "tiktok": Path("app/img/icon-tiktok.webp"),
+    "facebook": Path("app/img/icon-facebook.png"),
+    "youtube": Path("app/img/icon-youtube.png"),
+    "x": Path("app/img/icon-x.png"),
 }
-ICON_CACHE: Dict[str, str] = {}
+ICON_CACHE: Dict[str, tuple[str, str]] = {}
+
+
+def _parse_compact_number(raw: str) -> Optional[float]:
+    cleaned = raw.replace(",", "").strip().upper()
+    match = re.match(r"(-?\d+(?:\.\d+)?)([KMB]?)$", cleaned)
+    if not match:
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    num = float(match.group(1))
+    suffix = match.group(2)
+    multiplier = 1.0
+    if suffix == "K":
+        multiplier = 1_000.0
+    elif suffix == "M":
+        multiplier = 1_000_000.0
+    elif suffix == "B":
+        multiplier = 1_000_000_000.0
+    return num * multiplier
+
+
+def _parse_percentage_value(raw: str) -> Optional[float]:
+    text = raw.replace("%", "")
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _normalize_detail_entry(detail_key: str, value: Any) -> tuple[str, Any]:
+    if not isinstance(value, str):
+        return f"Detail - {detail_key}", value
+    text = value.strip()
+    lowered_value = text.lower()
+    lowered_key = detail_key.lower()
+
+    def _trim_suffix(suffix: str) -> None:
+        nonlocal text, lowered_value
+        if lowered_value.endswith(suffix):
+            text = text[: -len(suffix)].strip()
+            lowered_value = text.lower()
+
+    _trim_suffix(" followers")
+    _trim_suffix(" engagement rate")
+    column_key = detail_key
+    if column_key.startswith("Instagram"):
+        column_key = column_key.replace("Instagram", "").strip() or "Instagram"
+    if column_key.startswith("TikTok"):
+        column_key = column_key.replace("TikTok", "").strip() or "TikTok"
+
+    if "followers" in lowered_key and ("%" in lowered_value or "engagement" in lowered_value):
+        column_key = column_key.replace("Followers", "Engagement Rate") or "Engagement Rate"
+        lowered_key = column_key.lower()
+    elif "engagement rate" in lowered_key and ("followers" in lowered_value and "%" not in lowered_value):
+        column_key = column_key.replace("Engagement Rate", "Followers") or "Followers"
+        lowered_key = column_key.lower()
+
+    numeric_value: Optional[float] = None
+    if "followers" in lowered_key:
+        numeric_value = _parse_compact_number(text)
+    elif "engagement rate" in lowered_key:
+        numeric_value = _parse_percentage_value(text)
+
+    normalized_value: Any
+    if numeric_value is not None:
+        normalized_value = numeric_value
+    else:
+        normalized_value = text
+
+    return f"Detail - {column_key}", normalized_value
+
+
+def _compute_saturation_rate(organic_posts: float, sponsored_posts: float) -> Optional[float]:
+    if sponsored_posts is None or sponsored_posts <= 0:
+        return None
+    if organic_posts is None or organic_posts < 0:
+        organic_posts = 0.0
+    return organic_posts / sponsored_posts
+
+
+def _content_balance_score_from_rate(rate: Optional[float]) -> Optional[float]:
+    if rate is None:
+        return None
+    if rate >= 0.7:
+        return 1.0
+    if rate >= 0.5:
+        return 2.0
+    if rate >= 0.4:
+        return 3.0
+    if rate >= 0.3:
+        return 4.0
+    if rate >= 0.2:
+        return 5.0
+    return None
+
+
+def _safe_float(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _flatten_details(details: Any) -> Dict[str, Any]:
@@ -57,11 +167,12 @@ def _flatten_details(details: Any) -> Dict[str, Any]:
         return {"Detail - raw": details}
     flattened: Dict[str, Any] = {}
     for key, value in details.items():
-        column_name = f"Detail - {key}"
         if isinstance(value, (dict, list)):
+            column_name = f"Detail - {key}"
             flattened[column_name] = json.dumps(value)
         else:
-            flattened[column_name] = value
+            column_name, normalized = _normalize_detail_entry(key, value)
+            flattened[column_name] = normalized
     return flattened
 
 
@@ -92,7 +203,7 @@ def init_session_state() -> None:
     if "active_campaign_id" not in st.session_state:
         st.session_state.active_campaign_id = None
     if "active_view" not in st.session_state:
-        st.session_state.active_view = "Campaigns"
+        st.session_state.active_view = "Campaign Briefs"
 
 
 def inject_styles() -> None:
@@ -715,14 +826,19 @@ def _link_badge(link: str) -> str:
     for key, values in LINK_ICON_MAP.items():
         if key in netloc:
             badge = values
-            platform_key = "facebook" if key in ("fb.com", "facebook") else key
+            if key in ("fb.com", "facebook"):
+                platform_key = "facebook"
+            elif key in ("x.com", "twitter"):
+                platform_key = "x"
+            else:
+                platform_key = key
             break
     if not platform_key:
-        for key in ("instagram", "tiktok", "facebook"):
+        for key in ("instagram", "tiktok", "youtube", "facebook", "x"):
             if key in netloc:
                 platform_key = key
-            badge = LINK_ICON_MAP.get(key, badge)
-            break
+                badge = LINK_ICON_MAP.get(key, badge)
+                break
     color = badge["color"]
     icon_data = _get_icon_data(platform_key)
     label = badge["label"]
@@ -732,8 +848,9 @@ def _link_badge(link: str) -> str:
             short_path = short_path[:12] + "…"
         display = f"{display}/{short_path}"
     if icon_data:
+        mime, encoded = icon_data
         icon_markup = (
-            f"<img src='data:image/svg+xml;base64,{icon_data}' alt='{escape(label)}' "
+            f"<img src='data:{mime};base64,{encoded}' alt='{escape(label)}' "
             f"style='width:20px;height:20px;'/>"
         )
     else:
@@ -756,17 +873,27 @@ def _info_pill(label: str, value: str) -> str:
     )
 
 
-def _get_icon_data(key: Optional[str]) -> Optional[str]:
+def _get_icon_data(key: Optional[str]) -> Optional[tuple[str, str]]:
     if not key:
         return None
-    path = ICON_FILES.get(key)
+    norm_key = key.lower()
+    path = ICON_FILES.get(norm_key)
     if not path or not path.exists():
         return None
-    cached = ICON_CACHE.get(key)
+    cached = ICON_CACHE.get(norm_key)
     if cached:
         return cached
-    ICON_CACHE[key] = base64.b64encode(path.read_bytes()).decode("utf-8")
-    return ICON_CACHE[key]
+    suffix = path.suffix.lower()
+    mime_map = {
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+    }
+    mime = mime_map.get(suffix, "image/png")
+    ICON_CACHE[norm_key] = (mime, base64.b64encode(path.read_bytes()).decode("utf-8"))
+    return ICON_CACHE[norm_key]
 
 
 def run_with_timer(label: str, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
@@ -878,29 +1005,29 @@ def handle_registration(full_name: str, email: str, password: str) -> None:
 
 
 def render_application() -> None:
-    nav_col, content_col = st.columns([1, 3], gap="large")
-    with nav_col:
-        with tv_card("Navigation", "Jump between workspace modules.", badge="Menu"):
-            options = list(NAV_SECTIONS.keys())
-            try:
-                current_index = options.index(st.session_state.active_view)
-            except ValueError:
-                current_index = 0
-            selection = st.radio(
-                "Navigation",
-                options=options,
-                index=current_index,
-                label_visibility="hidden",
-                format_func=lambda label: f"{label} — {NAV_SECTIONS[label]}",
-            )
-            st.session_state.active_view = selection
-    with content_col:
-        if selection == "Campaigns":
-            render_campaigns_tab()
-        elif selection == "KOL Workflow":
-            render_kol_workflow_tab()
-        else:
-            render_dashboard_tab()
+    options = list(NAV_SECTIONS.keys())
+    active_view = st.session_state.active_view if st.session_state.active_view in options else options[0]
+    with tv_card("Navigation", "Jump between workspace modules.", badge="Menu"):
+        nav_cols = st.columns(len(options))
+        for option, col in zip(options, nav_cols):
+            with col:
+                is_active = option == active_view
+                if st.button(
+                    option,
+                    use_container_width=True,
+                    type="primary" if is_active else "secondary",
+                    key=f"nav_btn_{option}",
+                ):
+                    active_view = option
+                    st.session_state.active_view = option
+        st.caption(NAV_SECTIONS.get(active_view, ""))
+
+    if active_view == "Campaign Briefs":
+        render_campaigns_tab()
+    elif active_view == "Score Influencers":
+        render_kol_workflow_tab()
+    else:
+        render_dashboard_tab()
 
 
 def render_campaigns_tab() -> None:
@@ -981,212 +1108,210 @@ def render_campaigns_tab() -> None:
                             market=market,
                             objective=composed_objective,
                         )
-                        st.success(f"Campaign created (id {campaign_id}).")
+                        st.success(f"Campaign {name} created !")
 
     campaigns = database.list_campaigns_for_user(st.session_state.user["id"])
     with right_col:
         if not campaigns:
             st.info("No campaigns yet. Create one above.")
-            return
+        else:
+            campaign_labels = [f"{c['name']} | {c.get('market') or 'N/A'}" for c in campaigns]
+            try:
+                active_index = [c["id"] for c in campaigns].index(st.session_state.active_campaign_id)
+            except ValueError:
+                active_index = 0
+            with tv_card("Your Campaigns", "Switch focus and keep the key brief top of mind.", badge="Pipeline"):
+                selection = st.selectbox(
+                    "Active campaign",
+                    options=campaign_labels,
+                    index=active_index,
+                    key="campaign_select",
+                )
+                active_campaign = campaigns[campaign_labels.index(selection)]
+                st.session_state.active_campaign_id = active_campaign["id"]
+                raw_objective = (active_campaign.get("objective") or "").strip()
+                timeline_text = "-"
+                if raw_objective:
+                    filtered_lines: List[str] = []
+                    for line in raw_objective.splitlines():
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        if stripped.lower().startswith("timeline:"):
+                            timeline_text = stripped.split(":", 1)[1].strip() or "-"
+                        else:
+                            filtered_lines.append(stripped)
+                    objective_text = "\n".join(filtered_lines).strip() or "-"
+                else:
+                    objective_text = "-"
+                timeline_text = timeline_text.replace("\x1a", " - ").replace("\u2023", " - ")
+                truncated_objective = objective_text if len(objective_text) <= 260 else f"{objective_text[:257].rstrip()}..."
+                objective_markup = escape(truncated_objective).replace("\n", "<br>")
+                created_at_display = "-"
+                created_at_raw = active_campaign.get("created_at")
+                if created_at_raw:
+                    try:
+                        created_at_display = datetime.fromisoformat(created_at_raw).strftime("%b %d, %Y")
+                    except ValueError:
+                        created_at_display = created_at_raw.split("T")[0]
+                kol_count = len(database.list_campaign_influencers(active_campaign["id"]))
+                source_count = len(database.list_kol_sources(active_campaign["id"]))
+                client_display = active_campaign.get("client_name") or "-"
+                market_display = active_campaign.get("market") or "-"
+                st.markdown(
+                    f"""
+                    <div class="tv-campaign-summary">
+                        <div class="tv-campaign-summary__header">
+                            <p class="tv-campaign-eyebrow">Active campaign</p>
+                            <h4>{escape(active_campaign['name'])}</h4>
+                            <div class="tv-campaign-tags">
+                                <span class="tv-campaign-tag">{escape(client_display)}</span>
+                                <span class="tv-campaign-tag">{escape(market_display)}</span>
+                                <span class="tv-campaign-tag">Briefed {escape(created_at_display)}</span>
+                            </div>
+                        </div>
+                        <div class="tv-campaign-objective">
+                            <span>Objective focus</span>
+                            <p>{objective_markup}</p>
+                        </div>
+                        <div class="tv-campaign-stats">
+                            <div class="tv-campaign-stat">
+                                <label>Timeline</label>
+                                <strong>{escape(timeline_text or "-")}</strong>
+                            </div>
+                            <div class="tv-campaign-stat">
+                                <label>KOLs tracked</label>
+                                <strong>{kol_count}</strong>
+                            </div>
+                            <div class="tv-campaign-stat">
+                                <label>Imports logged</label>
+                                <strong>{source_count}</strong>
+                            </div>
+                            <div class="tv-campaign-stat">
+                                <label>Brief added</label>
+                                <strong>{escape(created_at_display)}</strong>
+                            </div>
+                        </div>
+                        <div class="tv-campaign-meta-grid">
+                            <div>
+                                <span>Client</span>
+                                <p>{escape(client_display)}</p>
+                            </div>
+                            <div>
+                                <span>Market</span>
+                                <p>{escape(market_display)}</p>
+                            </div>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+    if not campaigns:
+        return
+    active_campaign = next(
+        (c for c in campaigns if c["id"] == st.session_state.active_campaign_id),
+        campaigns[0],
+    )
+    render_campaign_ingestion_controls(active_campaign)
 
-        campaign_labels = [f"{c['name']} | {c.get('market') or 'N/A'}" for c in campaigns]
-        try:
-            active_index = [c["id"] for c in campaigns].index(st.session_state.active_campaign_id)
-        except ValueError:
-            active_index = 0
-        with tv_card("Your Campaigns", "Switch focus and keep the key brief top of mind.", badge="Pipeline"):
-            selection = st.selectbox(
-                "Active campaign",
-                options=campaign_labels,
-                index=active_index,
-                key="campaign_select",
-            )
-            active_campaign = campaigns[campaign_labels.index(selection)]
-            st.session_state.active_campaign_id = active_campaign["id"]
-            raw_objective = (active_campaign.get("objective") or "").strip()
-            timeline_text = "-"
-            if raw_objective:
-                filtered_lines: List[str] = []
-                for line in raw_objective.splitlines():
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    if stripped.lower().startswith("timeline:"):
-                        timeline_text = stripped.split(":", 1)[1].strip() or "-"
-                    else:
-                        filtered_lines.append(stripped)
-                objective_text = "\n".join(filtered_lines).strip() or "-"
+
+def render_campaign_ingestion_controls(campaign: Dict[str, Any]) -> None:
+    st.markdown(f"### Manage creators for {escape(campaign['name'])}")
+    with tv_card("Add KOLs", "Drop a publish KOL list to ingest data.", badge="Ingest"):
+        with st.form(f"kol_link_form_{campaign['id']}"):
+            publish_link = st.text_input("Publish link / profile URL")
+            count_col, button_col = st.columns([2, 1])
+            with count_col:
+                max_profiles = st.number_input(
+                    "Number of profiles to scrape",
+                    min_value=1,
+                    max_value=500,
+                    value=4,
+                    step=1,
+                    help="Check the number of profiles to import from the CreatorIQ report",
+                    key=f"import_count_{campaign['id']}",
+                )
+            with button_col:
+                st.markdown("<div style='height:1.8rem;'></div>", unsafe_allow_html=True)
+                submitted = st.form_submit_button("Import KOLs", use_container_width=True)
+            if submitted:
+                if not publish_link:
+                    st.error("Please provide a publish link.")
+                else:
+                    try:
+                        if is_creatoriq_link(publish_link):
+                            try:
+                                summary = run_with_timer(
+                                    "Importing KOL list from your Publish Link",
+                                    ingestion.ingest_creatoriq_report_dom,
+                                    campaign["id"],
+                                    publish_link,
+                                    max_profiles=int(max_profiles),
+                                    detail_limit=int(max_profiles),
+                                )
+                            except Exception as dom_error:
+                                st.warning(f"DOM scraper failed ({dom_error}). Attempting CreatorIQ API fallback.")
+                                summary = run_with_timer(
+                                    "CreatorIQ API import",
+                                    ingestion.ingest_creatoriq_report,
+                                    campaign["id"],
+                                    publish_link,
+                                )
+                            count = summary.get("count", 0)
+                            st.success(f"Imported {count} creator(s) from the CreatorIQ report.")
+                            for warning in summary.get("warnings", []):
+                                st.warning(warning)
+                        else:
+                            profile = run_with_timer(
+                                "Fetching profile",
+                                scraping.fetch_kol_profile,
+                                publish_link,
+                            )
+                            influencer = database.upsert_influencer(profile)
+                            database.ensure_campaign_influencer(campaign["id"], influencer["id"])
+                            database.add_kol_source(
+                                campaign_id=campaign["id"],
+                                publish_link=publish_link,
+                                platform=profile["platform"],
+                                payload=profile,
+                                status="ingested",
+                            )
+                            st.success(f"Added {influencer['name']} ({influencer['platform']}).")
+                        st.rerun()
+                    except CreatorIQError as err:
+                        st.error(f"CreatorIQ import failed: {err}")
+                    except Exception as exc:
+                        st.error(f"Unable to ingest link: {exc}")
+
+    sources = database.list_kol_sources(campaign["id"])
+    if sources:
+        with tv_card("Recent KOL List", "Latest CreatorIQ imports and single profiles.", badge="History"):
+            st.markdown("##### Latest KOL entries")
+            source = sources[0]
+            platform = source.get("platform") or "Unknown"
+            link = source.get("publish_link") or "-"
+            status = source.get("status") or "-"
+            if link and link != "-":
+                link_markup = f"<a href='{escape(link)}' target='_blank' style='color:#0A6CC2;font-weight:600;text-decoration:none;'>{escape(link)}</a>"
             else:
-                objective_text = "-"
-            timeline_text = timeline_text.replace("\x1a", " – ").replace("\u2023", " – ")
-            truncated_objective = objective_text if len(objective_text) <= 260 else f"{objective_text[:257].rstrip()}..."
-            objective_markup = escape(truncated_objective).replace("\n", "<br>")
-            created_at_display = "-"
-            created_at_raw = active_campaign.get("created_at")
-            if created_at_raw:
-                try:
-                    created_at_display = datetime.fromisoformat(created_at_raw).strftime("%b %d, %Y")
-                except ValueError:
-                    created_at_display = created_at_raw.split("T")[0]
-            kol_count = len(database.list_campaign_influencers(active_campaign["id"]))
-            source_count = len(database.list_kol_sources(active_campaign["id"]))
-            client_display = active_campaign.get("client_name") or "-"
-            market_display = active_campaign.get("market") or "-"
+                link_markup = "<span style='color:rgba(10,34,58,0.55);'>No link</span>"
             st.markdown(
                 f"""
-                <div class="tv-campaign-summary">
-                    <div class="tv-campaign-summary__header">
-                        <p class="tv-campaign-eyebrow">Active campaign</p>
-                        <h4>{escape(active_campaign['name'])}</h4>
-                        <div class="tv-campaign-tags">
-                            <span class="tv-campaign-tag">{escape(client_display)}</span>
-                            <span class="tv-campaign-tag">{escape(market_display)}</span>
-                            <span class="tv-campaign-tag">Briefed {escape(created_at_display)}</span>
-                        </div>
+                <div style="margin-bottom:0.6rem;">
+                    <div style="font-weight:600;color:#0A223A;">
+                        {escape(platform)}
+                        <span style="margin-left:0.5rem;color:rgba(10,34,58,0.65);text-transform:uppercase;font-size:0.75rem;font-weight:600;">
+                            {escape(status)}
+                        </span>
                     </div>
-                    <div class="tv-campaign-objective">
-                        <span>Objective focus</span>
-                        <p>{objective_markup}</p>
-                    </div>
-                    <div class="tv-campaign-stats">
-                        <div class="tv-campaign-stat">
-                            <label>Timeline</label>
-                            <strong>{escape(timeline_text or "-")}</strong>
-                        </div>
-                        <div class="tv-campaign-stat">
-                            <label>KOLs tracked</label>
-                            <strong>{kol_count}</strong>
-                        </div>
-                        <div class="tv-campaign-stat">
-                            <label>Imports logged</label>
-                            <strong>{source_count}</strong>
-                        </div>
-                        <div class="tv-campaign-stat">
-                            <label>Brief added</label>
-                            <strong>{escape(created_at_display)}</strong>
-                        </div>
-                    </div>
-                    <div class="tv-campaign-meta-grid">
-                        <div>
-                            <span>Client</span>
-                            <p>{escape(client_display)}</p>
-                        </div>
-                        <div>
-                            <span>Market</span>
-                            <p>{escape(market_display)}</p>
-                        </div>
-                    </div>
+                    <div style="font-size:0.85rem;margin-top:0.2rem;">{link_markup}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
-
-
-
-def render_kol_workflow_tab() -> None:
-    campaign = get_active_campaign()
-    if not campaign:
-        st.warning("Select a campaign in the Campaigns tab to start scoring.")
-        return
-    section_heading(f"KOL workflow • {campaign['name']}", "Scrape CreatorIQ reports or add individual publish links.")
-    left_col, right_col = st.columns([1.1, 1.9], gap="large")
-    with left_col:
-        with tv_card("Add KOLs", "Drop a publish KOL list to ingest data.", badge="Ingest"):
-            with st.form("kol_link_form"):
-                publish_link = st.text_input("Publish link / profile URL")
-                count_col, button_col = st.columns([2, 1])
-                with count_col:
-                    max_profiles = st.number_input(
-                        "Number of profiles to scrape",
-                        min_value=1,
-                        max_value=500,
-                        value=4,
-                        step=1,
-                        help="Check the number of profiles to import from the CreatorIQ report",
-                    )
-                with button_col:
-                    st.markdown("<div style='height:1.8rem;'></div>", unsafe_allow_html=True)
-                    submitted = st.form_submit_button("Import KOLs", use_container_width=True)
-                if submitted:
-                    if not publish_link:
-                        st.error("Please provide a publish link.")
-                    else:
-                        try:
-                            if is_creatoriq_link(publish_link):
-                                try:
-                                    summary = run_with_timer(
-                                        "Importing KOL list from CreatorIQ DOM",
-                                        ingestion.ingest_creatoriq_report_dom,
-                                        campaign["id"],
-                                        publish_link,
-                                        max_profiles=int(max_profiles),
-                                        detail_limit=int(max_profiles),
-                                    )
-                                except Exception as dom_error:
-                                    st.warning(f"DOM scraper failed ({dom_error}). Attempting CreatorIQ API fallback.")
-                                    summary = run_with_timer(
-                                        "CreatorIQ API import",
-                                        ingestion.ingest_creatoriq_report,
-                                        campaign["id"],
-                                        publish_link,
-                                    )
-                                count = summary.get("count", 0)
-                                st.success(f"Imported {count} creator(s) from the CreatorIQ report.")
-                                for warning in summary.get("warnings", []):
-                                    st.warning(warning)
-                            else:
-                                profile = run_with_timer(
-                                    "Fetching profile",
-                                    scraping.fetch_kol_profile,
-                                    publish_link,
-                                )
-                                influencer = database.upsert_influencer(profile)
-                                database.ensure_campaign_influencer(campaign["id"], influencer["id"])
-                                database.add_kol_source(
-                                    campaign_id=campaign["id"],
-                                    publish_link=publish_link,
-                                    platform=profile["platform"],
-                                    payload=profile,
-                                    status="ingested",
-                                )
-                                st.success(f"Added {influencer['name']} ({influencer['platform']}).")
-                            st.rerun()
-                        except CreatorIQError as err:
-                            st.error(f"CreatorIQ import failed: {err}")
-                        except Exception as exc:
-                            st.error(f"Unable to ingest link: {exc}")
-            sources = database.list_kol_sources(campaign["id"])
-            if sources:
-                with tv_card("Recent KOL List", "Latest CreatorIQ imports and single profiles.", badge="History"):
-                    st.markdown("##### Latest KOL entries")
-                    source = sources[0]
-                    platform = source.get("platform") or "Unknown"
-                    link = source.get("publish_link") or "-"
-                    status = source.get("status") or "-"
-                    if link and link != "-":
-                        link_markup = f"<a href='{escape(link)}' target='_blank' style='color:#0A6CC2;font-weight:600;text-decoration:none;'>{escape(link)}</a>"
-                    else:
-                        link_markup = "<span style='color:rgba(10,34,58,0.55);'>No link</span>"
-                    st.markdown(
-                        f"""
-                        <div style="margin-bottom:0.6rem;">
-                            <div style="font-weight:600;color:#0A223A;">
-                                {escape(platform)}
-                                <span style="margin-left:0.5rem;color:rgba(10,34,58,0.65);text-transform:uppercase;font-size:0.75rem;font-weight:600;">
-                                    {escape(status)}
-                                </span>
-                            </div>
-                            <div style="font-size:0.85rem;margin-top:0.2rem;">{link_markup}</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-    sources = database.list_kol_sources(campaign["id"])
-    raw_profile_rows = []
-    if sources:
+        raw_profile_rows: List[Dict[str, Any]] = []
         for source in sources:
-            payload = {}
+            payload: Dict[str, Any] = {}
             raw_payload = source.get("raw_payload")
             if raw_payload:
                 try:
@@ -1214,6 +1339,50 @@ def render_kol_workflow_tab() -> None:
                 st.dataframe(raw_df, use_container_width=True, hide_index=True)
         else:
             st.info("Raw profile payloads not available for these sources.")
+
+
+
+def render_kol_workflow_tab() -> None:
+    campaign = get_active_campaign()
+    if not campaign:
+        st.warning("Select a campaign in the Campaign Briefs tab to start scoring.")
+        return
+    section_heading(f"KOL workflow • {campaign['name']}", "Scrape CreatorIQ reports or add individual publish links.")
+    left_col, right_col = st.columns([1.1, 1.9], gap="large")
+
+
+    with left_col:
+        with tv_card("KOL Pool", "Reuse existing creators imported by your team.", badge="Pool"):
+            search_value = st.text_input(
+                "Search by name, handle, or platform",
+                key=f"kol_pool_search_{campaign['id']}",
+                placeholder="@handle, creator name, TikTok...",
+            )
+            pool_rows = database.list_all_influencers(search_value)
+            if not pool_rows:
+                st.info("No creators match this search yet.")
+            else:
+                pool_df = pd.DataFrame(pool_rows)
+                display_cols = ["name", "handle", "platform", "follower_count", "last_seen_at"]
+                display_df = pool_df[display_cols]
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+                option_map: Dict[str, Dict[str, Any]] = {}
+                for row in pool_rows:
+                    name = row.get("name") or "Unknown"
+                    handle = row.get("handle") or "-"
+                    platform = row.get("platform") or "Unknown"
+                    label = f"{name} (@{handle}) - {platform}"
+                    option_map[label] = row
+                selection = st.selectbox(
+                    "Select a KOL to add to this campaign",
+                    options=list(option_map.keys()),
+                    key=f"kol_pool_select_{campaign['id']}",
+                )
+                if st.button("Add selected KOL", key=f"kol_pool_add_{campaign['id']}"):
+                    chosen = option_map[selection]
+                    database.ensure_campaign_influencer(campaign["id"], chosen["id"])
+                    st.success(f"Added {chosen['name']} to {campaign['name']}.")
+                    st.rerun()
 
     with right_col:
         render_scoring_form(campaign)
@@ -1306,8 +1475,20 @@ def render_scoring_form(campaign: Dict[str, Any]) -> None:
                 badges = "".join(_link_badge(link) for link in link_targets[:4])
                 st.markdown(f"<div class='tv-link-grid'>{badges}</div>", unsafe_allow_html=True)
         with profile_cols[1]:
+            platform_key = (selected.get("platform") or "").lower()
+            icon_data = _get_icon_data(platform_key)
+            if icon_data:
+                mime, encoded = icon_data
+                icon_markup = (
+                    f"<img src='data:{mime};base64,{encoded}' alt='{escape(platform_key or 'platform')}' "
+                    f"style='width:26px;height:26px;'/>"
+                )
+            else:
+                icon_markup = ""
             st.markdown(
-                f"<h3 style='margin-bottom:0.2rem;'>{escape(selected['name'])}</h3>",
+                f"<div style='display:flex;align-items:center;gap:0.4rem;'>"
+                f"{icon_markup}"
+                f"<h3 style='margin:0;'>{escape(selected['name'])}</h3></div>",
                 unsafe_allow_html=True,
             )
             if handle_display:
@@ -1333,17 +1514,62 @@ def render_scoring_form(campaign: Dict[str, Any]) -> None:
                 _info_pill("Platform", selected.get("platform") or "—"),
                 unsafe_allow_html=True,
             )
+        saved_balance_raw = selected.get("content_balance")
+        saved_balance_score = _safe_float(saved_balance_raw, default=None) if saved_balance_raw is not None else None
+        engagement_display = quant_scores["engagement_score"]
+        if saved_balance_score is not None:
+            engagement_display = round(
+                (engagement_display * 0.7) + (saved_balance_score * 0.3),
+                2,
+            )
         star_cols = st.columns(3)
         with star_cols[0]:
             _render_star_row("Reach score", quant_scores["reach_score"])
         with star_cols[1]:
             _render_star_row("Interest score", quant_scores["interest_score"])
         with star_cols[2]:
-            _render_star_row("Engagement score", quant_scores["engagement_score"])
+            _render_star_row("Engagement score", engagement_display)
+            if saved_balance_score is not None:
+                st.caption(f"Content balance: {saved_balance_score:.1f}")
 
     with tv_card("Manual scoring", "Provide your qualitative inputs.", badge="Score input"):
         suffix = selected.get("campaign_influencer_id")
         with st.form(f"score_form_{suffix}"):
+            organic_default = float(_safe_float(selected.get("organic_posts_l2m"), 0.0) or 0.0)
+            sponsored_default = float(_safe_float(selected.get("sponsored_posts_l2m"), 0.0) or 0.0)
+            saturation_cols = st.columns(2, gap="large")
+            with saturation_cols[0]:
+                organic_posts = st.number_input(
+                    "Estimated organic posts (last 2 months)",
+                    min_value=0.0,
+                    value=organic_default,
+                    step=1.0,
+                    key=f"organic_posts_{suffix}",
+                )
+            with saturation_cols[1]:
+                sponsored_posts = st.number_input(
+                    "Estimated sponsored posts (last 2 months)",
+                    min_value=0.0,
+                    value=sponsored_default,
+                    step=1.0,
+                    key=f"sponsored_posts_{suffix}",
+                )
+            saturation_rate = _compute_saturation_rate(organic_posts, sponsored_posts)
+            content_balance_score = _content_balance_score_from_rate(saturation_rate)
+            base_engagement = quant_scores["engagement_score"]
+            engagement_preview = base_engagement
+            if content_balance_score is not None:
+                engagement_preview = round(
+                    (base_engagement * 0.7) + (content_balance_score * 0.3),
+                    2,
+                )
+                st.caption(
+                    f"Content balance score: {content_balance_score:.1f}  |  "
+                    f"Saturation rate: {saturation_rate:.2f}  |  "
+                    f"Engagement score preview: {engagement_preview:.2f}"
+                )
+            else:
+                st.caption("Add both estimates (sponsored posts must be > 0) to factor balance into engagement/content.")
             manual_cols = st.columns(2, gap="large")
             with manual_cols[0]:
                 content_originality = st.slider(
@@ -1386,7 +1612,11 @@ def render_scoring_form(campaign: Dict[str, Any]) -> None:
                     reach_score=quant_scores["reach_score"],
                     interest_score=quant_scores["interest_score"],
                     engagement_rate=quant_scores["engagement_rate"],
-                    engagement_score=quant_scores["engagement_score"],
+                    engagement_score=engagement_preview,
+                    content_balance_score=content_balance_score,
+                    organic_posts_l2m=organic_posts,
+                    sponsored_posts_l2m=sponsored_posts,
+                    saturation_rate=saturation_rate,
                     content_originality=content_originality,
                     content_creativity=content_creativity,
                     authority_overall=authority_overall,
